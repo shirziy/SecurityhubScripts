@@ -1,0 +1,128 @@
+<#
+.SYNOPSIS
+    Version 1
+.DESCRIPTION
+    This script is used to update Tenable/Nessus findings in Security Hub findings in the following ways:  Update Workflow Status from NEW to NOTIFIED, Add a UserDefinedField to track the Jira Ticket assigned to the finding, Update the UserDefinedField text when a Jira ticket changes (i.e. Cloud Support, AWS Tech Support, etc.).
+.PARAMETER System Acronym (i.e. APS, UCM)
+    The system acronym
+.PARAMETER EUAID
+    Your CMS Enterprise User ID
+.PARAMETER Workflow Status (i.e. New, NewNotified, Notified)
+	The AWS Security Hub Workflow Status to pull from.  Choose "NEW" to only pull down NEW finding, "NOTIFIED" to pull down previously updated findings, and "NEWNOTIFIED" to pull both.
+.PARAMETER Severity
+	The severity rating of the finding or findings, by first letter (C=Critical, H=High, M=Medium, L=Low, I=Informational).  You can selectd a single severity (C, H, M, L, or I) or choose between two groupings "CHML" or "HMLI".  If no severity is chosen, the default will return all severities.
+.EXAMPLE
+    C:\PS> 
+	PS>.\Nash-UpdateFindings-V2.ps1
+
+	cmdlet Nash-UpdateFindings-V2.ps1 at command pipeline position 1
+	Supply values for the following parameters:
+	System Acronym (i.e. APS, UCM): APS
+	Workflow Status (i.e. New, NewNotified, Notified): NewNotified
+	Severity: H
+	EUAID: ecki
+	SecurePassword: ********
+    
+.NOTES
+    Author: Brian Edwards
+    Date:   March 16, 2023
+	
+	3/16/23 - Initial Version - modified the SecHub-NessusFindings-Update script to accommodate Nash Testing findings. 
+	4/12/23 - Version 2 - Added processing of findings to omit anything that does not apply to an EC2 instance by filtering on the Finding ID for only those with an instance prefix (i-).  Added Workflow Status and Jira to the gridview to assist with selecting findings for update.  Updated Help content.
+#>
+
+Param (
+	[Parameter(Mandatory)][ValidateSet("APS","UCM")][Alias("Org")][String]${System Acronym (i.e. APS, UCM)},
+	[Parameter(Mandatory)][ValidateSet("NEW","NEWNOTIFIED","NOTIFIED")][Alias("WFStatus")][String]${Workflow Status (i.e. New, NewNotified, Notified)},
+	[Parameter(Mandatory)][ValidateSet("C","H","M","L","I","CHML","HMLI")][String]$Severity,
+    [Parameter(Mandatory=$True)][string]$EUAID,
+	[System.Security.SecureString][Parameter(Mandatory)]$SecurePassword
+)
+$Password = (New-Object System.Management.Automation.PSCredential('dummy',$SecurePassword)).getnetworkcredential().password
+$Org=${System Acronym (i.e. APS, UCM)}
+switch ($Org)
+{
+    "APS" {$role="APS Operations"}
+    "UCM" {$role="UCM Application Admin"}
+}
+$WFStatus=${Workflow Status (i.e. New, NewNotified, Notified)}
+
+write-host "Initialization section starting"
+#Initialization Section Start
+#set default region and import necessary modules
+import-module aws.tools.common
+import-module aws.tools.securityHub
+import-module PSScriptFunctions
+set-defaultawsregion us-east-1
+
+#initialize static variables
+$OuterArray=@()
+$GID="cms.tenable"
+$ProdName="Nash Testing"
+
+write-host "initializing filter..."
+#build filter from PSScriptFunctions module
+$Filter=get-AWSFilter -WFStatus $WFStatus -prodname $ProdName -Severity $Severity -Type Vulnerability 
+
+write-host "initializing auth check..."
+#Pre-script authentication check to avoid account lockout
+$Auth=get-AuthToken -EUAID $EUAID -password $password
+if($Auth.StatusCode -ne 200){
+	write-host "Authentication failed, please check your EUAID or password and try again."
+	break
+}else{
+	$Token=($Auth.content | convertfrom-json).data.access.token
+	write-host "Authentication successful, retrieving data..."
+	
+	#obtain short-term access credentials
+	$PSCreds,$env=get-CloudTamerCredsWithPrompt -Token $Token -Role $role
+	write-host "obtaining information for $env"
+	
+	$AccessKey=$PSCreds.access_key
+	$SecretKey=$PSCreds.secret_access_key
+	$SessionToken=$PSCreds.session_token
+
+	#Main Body Start
+
+	#initialize index
+	$index=1
+	#run the cmdlet to retrieve Security Hub findings...
+	$Findings = get-shubfinding -AccessKey $AccessKey -SecretKey $SecretKey -SessionToken $SessionToken -filter $filter
+	$count=$Findings.Count
+	#if no findings exist, display a message on the screen
+	if($Count -eq 0){
+		write-host "No Nash Testing Findings in $env.  Congratulations!"
+	}Else{
+		#remove findings that are not associated with an instance (i.e. only assigned an IP address to the finding).  
+		$Findings=$Findings | ?{$_.Id -like "*/i-*"}
+		#display message with the total count of findings before passing to ArrayBuilder
+		$message=$Count.toString()+" NEW Nash Testing findings in "+$env
+		write-host $message
+		#Present user with gridview of the subset of applicable findings to choose from (multiselect)
+		$Updates=$Findings | select-object `
+		Title,
+		@{Name="WFStatus"; Expression={ $_.Workflow.Status.Value}},
+		@{Name="Jira"; Expression={ $_.UserDefinedFields.Jira}},
+		ProductArn,
+		Id `
+		| out-gridview -passthru -title "Select Finding(s) to Update"
+		#Prompt User to enter Jira ID for the ticket created for the finding.
+		$Jira=read-host "Enter Jira Ticket#"
+		#convert the user input to string
+		$Jira=$Jira.ToString()
+		#initialize the UserDefinedFields hashtable
+		$UDF=@{}
+		#assign the user-provided Jira Ticket# to the key "Jira"
+		$UDF.Jira=$Jira
+		$Updates | %{
+			#initialize FindingID variable to populate with unique finding identifers
+			$FindingID = new-object Amazon.SecurityHub.Model.AwsSecurityFindingIdentifier
+			$FindingID.Id=$_.Id
+			$FindingID.ProductArn=$_.ProductArn
+			$ProcessedFindings=Update-SHUBFindingsBatch -FindingIdentifier $FindingID -Workflow_Status NOTIFIED -UserDefinedField $UDF -AccessKey $AccessKey -SecretKey $SecretKey -SessionToken $SessionToken
+			write-host $ProcessedFindings.ProcessedFindings.Id
+		}
+	}
+	#Main Body End
+}
+	
